@@ -1,6 +1,6 @@
 # nanocode
 
-Minimal Claude Code alternative. Single Python file, zero dependencies, ~250 lines.
+Minimal Gemini Code alternative. Single Python file, zero dependencies, ~250 lines.
 
 Built using Claude Code, then used to build itself.
 
@@ -8,7 +8,7 @@ Built using Claude Code, then used to build itself.
 
 ## Features
 
-- Full agentic loop with tool use
+- Full agentic loop with tool use (Gemini function calling)
 - Tools: `read`, `write`, `edit`, `glob`, `grep`, `bash`
 - Conversation history
 - Colored terminal output
@@ -16,24 +16,18 @@ Built using Claude Code, then used to build itself.
 ## Usage
 
 ```bash
-export ANTHROPIC_API_KEY="your-key"
+export GEMINI_API_KEY="your-key"
 python nanocode.py
 ```
 
-### OpenRouter
+Or create a `.env` with `GEMINI_API_KEY=...` in the current directory or the
+`nanocode.py` directory (environment variables still take precedence).
 
-Use [OpenRouter](https://openrouter.ai) to access any model:
-
-```bash
-export OPENROUTER_API_KEY="your-key"
-python nanocode.py
-```
-
-To use a different model:
+To use a different Gemini model:
 
 ```bash
-export OPENROUTER_API_KEY="your-key"
-export MODEL="openai/gpt-5.2"
+export GEMINI_API_KEY="your-key"
+export MODEL="gemini-3-flash-preview"
 python nanocode.py
 ```
 

@@ -1,11 +1,50 @@
 #!/usr/bin/env python3
-"""nanocode - minimal claude code alternative"""
+"""nanocode - minimal gemini code alternative"""
 
 import glob as globlib, json, os, re, subprocess, urllib.request
 
-OPENROUTER_KEY = os.environ.get("OPENROUTER_API_KEY")
-API_URL = "https://openrouter.ai/api/v1/messages" if OPENROUTER_KEY else "https://api.anthropic.com/v1/messages"
-MODEL = os.environ.get("MODEL", "anthropic/claude-opus-4.5" if OPENROUTER_KEY else "claude-opus-4-5")
+
+def load_dotenv(paths):
+    for path in paths:
+        if not path or not os.path.isfile(path):
+            continue
+        try:
+            with open(path) as f:
+                for line in f:
+                    stripped = line.strip()
+                    if not stripped or stripped.startswith("#"):
+                        continue
+                    if stripped.startswith("export "):
+                        stripped = stripped[len("export ") :].lstrip()
+                    if "=" not in stripped:
+                        continue
+                    key, value = stripped.split("=", 1)
+                    key = key.strip()
+                    value = value.strip()
+                    if not key:
+                        continue
+                    if (
+                        (value.startswith("'") and value.endswith("'"))
+                        or (value.startswith('"') and value.endswith('"'))
+                    ):
+                        value = value[1:-1]
+                    elif "#" in value:
+                        value = value.split("#", 1)[0].rstrip()
+                    os.environ.setdefault(key, value)
+        except OSError:
+            continue
+
+
+load_dotenv(
+    [
+        os.path.join(os.getcwd(), ".env"),
+        os.path.join(os.path.dirname(__file__), ".env"),
+    ]
+)
+
+API_URL = "https://generativelanguage.googleapis.com/v1beta/interactions"
+MODEL = os.environ.get("MODEL", "gemini-3-flash-preview")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 
 # ANSI colors
 RESET, BOLD, DIM = "\033[0m", "\033[1m", "\033[2m"
@@ -153,36 +192,41 @@ def make_schema():
             }
             if not is_optional:
                 required.append(param_name)
+        schema = {
+            "type": "object",
+            "properties": properties,
+        }
+        if required:
+            schema["required"] = required
         result.append(
             {
+                "type": "function",
                 "name": name,
                 "description": description,
-                "input_schema": {
-                    "type": "object",
-                    "properties": properties,
-                    "required": required,
-                },
+                "parameters": schema,
             }
         )
     return result
 
 
-def call_api(messages, system_prompt):
+def call_api(input_data, system_prompt, previous_interaction_id=None):
+    if not GEMINI_API_KEY:
+        raise RuntimeError("Missing GEMINI_API_KEY")
+    payload = {
+        "model": MODEL,
+        "input": input_data,
+        "tools": make_schema(),
+        "system_instruction": system_prompt,
+        "generation_config": {"max_output_tokens": 8192},
+    }
+    if previous_interaction_id:
+        payload["previous_interaction_id"] = previous_interaction_id
     request = urllib.request.Request(
         API_URL,
-        data=json.dumps(
-            {
-                "model": MODEL,
-                "max_tokens": 8192,
-                "system": system_prompt,
-                "messages": messages,
-                "tools": make_schema(),
-            }
-        ).encode(),
+        data=json.dumps(payload).encode(),
         headers={
             "Content-Type": "application/json",
-            "anthropic-version": "2023-06-01",
-            **({"Authorization": f"Bearer {OPENROUTER_KEY}"} if OPENROUTER_KEY else {"x-api-key": os.environ.get("ANTHROPIC_API_KEY", "")}),
+            "x-goog-api-key": GEMINI_API_KEY,
         },
     )
     response = urllib.request.urlopen(request)
@@ -197,9 +241,41 @@ def render_markdown(text):
     return re.sub(r"\*\*(.+?)\*\*", f"{BOLD}\\1{RESET}", text)
 
 
+def normalize_tool_args(tool_args):
+    if isinstance(tool_args, dict):
+        return tool_args, None
+    if isinstance(tool_args, str):
+        try:
+            return json.loads(tool_args), None
+        except json.JSONDecodeError:
+            return None, f"error: tool arguments not valid JSON: {tool_args}"
+    if tool_args is None:
+        return {}, None
+    return None, f"error: tool arguments must be object, got {type(tool_args).__name__}"
+
+
+def preview_tool_args(tool_args):
+    if isinstance(tool_args, dict) and tool_args:
+        return str(next(iter(tool_args.values())))[:50]
+    if tool_args:
+        return str(tool_args)[:50]
+    return ""
+
+
+def handle_outputs(outputs):
+    tool_calls = []
+    for output in outputs:
+        output_type = output.get("type")
+        if output_type == "text":
+            print(f"\n{CYAN}⏺{RESET} {render_markdown(output.get('text', ''))}")
+        elif output_type == "function_call":
+            tool_calls.append(output)
+    return tool_calls
+
+
 def main():
-    print(f"{BOLD}nanocode{RESET} | {DIM}{MODEL} ({'OpenRouter' if OPENROUTER_KEY else 'Anthropic'}) | {os.getcwd()}{RESET}\n")
-    messages = []
+    print(f"{BOLD}nanocode{RESET} | {DIM}{MODEL} (Gemini) | {os.getcwd()}{RESET}\n")
+    previous_interaction_id = None
     system_prompt = f"Concise coding assistant. cwd: {os.getcwd()}"
 
     while True:
@@ -212,52 +288,59 @@ def main():
             if user_input in ("/q", "exit"):
                 break
             if user_input == "/c":
-                messages = []
+                previous_interaction_id = None
                 print(f"{GREEN}⏺ Cleared conversation{RESET}")
                 continue
 
-            messages.append({"role": "user", "content": user_input})
-
             # agentic loop: keep calling API until no more tool calls
+            interaction = call_api(
+                user_input,
+                system_prompt,
+                previous_interaction_id=previous_interaction_id,
+            )
+            previous_interaction_id = interaction.get("id", previous_interaction_id)
             while True:
-                response = call_api(messages, system_prompt)
-                content_blocks = response.get("content", [])
-                tool_results = []
-
-                for block in content_blocks:
-                    if block["type"] == "text":
-                        print(f"\n{CYAN}⏺{RESET} {render_markdown(block['text'])}")
-
-                    if block["type"] == "tool_use":
-                        tool_name = block["name"]
-                        tool_args = block["input"]
-                        arg_preview = str(list(tool_args.values())[0])[:50]
-                        print(
-                            f"\n{GREEN}⏺ {tool_name.capitalize()}{RESET}({DIM}{arg_preview}{RESET})"
-                        )
-
-                        result = run_tool(tool_name, tool_args)
-                        result_lines = result.split("\n")
-                        preview = result_lines[0][:60]
-                        if len(result_lines) > 1:
-                            preview += f" ... +{len(result_lines) - 1} lines"
-                        elif len(result_lines[0]) > 60:
-                            preview += "..."
-                        print(f"  {DIM}⎿  {preview}{RESET}")
-
-                        tool_results.append(
-                            {
-                                "type": "tool_result",
-                                "tool_use_id": block["id"],
-                                "content": result,
-                            }
-                        )
-
-                messages.append({"role": "assistant", "content": content_blocks})
-
-                if not tool_results:
+                tool_calls = handle_outputs(interaction.get("outputs", []))
+                if not tool_calls:
                     break
-                messages.append({"role": "user", "content": tool_results})
+
+                tool_results = []
+                for call in tool_calls:
+                    tool_name = call.get("name", "")
+                    raw_args = call.get("arguments", {})
+                    arg_preview = preview_tool_args(raw_args)
+                    print(
+                        f"\n{GREEN}⏺ {tool_name.capitalize()}{RESET}({DIM}{arg_preview}{RESET})"
+                    )
+
+                    tool_args, arg_error = normalize_tool_args(raw_args)
+                    if arg_error:
+                        result = arg_error
+                    else:
+                        result = run_tool(tool_name, tool_args)
+                    result_lines = result.split("\n")
+                    preview = result_lines[0][:60]
+                    if len(result_lines) > 1:
+                        preview += f" ... +{len(result_lines) - 1} lines"
+                    elif len(result_lines[0]) > 60:
+                        preview += "..."
+                    print(f"  {DIM}⎿  {preview}{RESET}")
+
+                    tool_results.append(
+                        {
+                            "type": "function_result",
+                            "name": tool_name,
+                            "call_id": call.get("id", ""),
+                            "result": result,
+                        }
+                    )
+
+                interaction = call_api(
+                    tool_results,
+                    system_prompt,
+                    previous_interaction_id=previous_interaction_id,
+                )
+                previous_interaction_id = interaction.get("id", previous_interaction_id)
 
             print()
 
